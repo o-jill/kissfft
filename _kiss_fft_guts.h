@@ -19,18 +19,32 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 #include "kiss_fft.h"
 #include <limits.h>
 
+#include <immintrin.h>
+
 #define MAXFACTORS 32
 /* e.g. an fft of length 128 has 4 factors 
  as far as kissfft is concerned
  4*4*4*2
  */
 
+#if (0)
+    // no simd
 struct kiss_fft_state{
     int nfft;
     int inverse;
     int factors[2*MAXFACTORS];
     kiss_fft_cpx twiddles[1];
 };
+#else
+    // simd
+struct kiss_fft_state{
+    int nfft;
+    int inverse;
+    int factors[2*MAXFACTORS];
+    int dummy[2];  // twiddlesのアドレス調整(x64用)
+    kiss_fft_cpx twiddles[1];
+};
+#endif
 
 /*
   Explanation of macros dealing with complex math:
@@ -40,25 +54,27 @@ struct kiss_fft_state{
    C_SUB( res, a,b)     : res = a - b
    C_SUBFROM( res , a)  : res -= a
    C_ADDTO( res , a)    : res += a
+   C_ADD2( res, a,b)    : res += a + b
+   C_ADDSUB(res1, res2, a, b) : res1 = a+b; res2 = a-b;
  * */
 #ifdef FIXED_POINT
-#if (FIXED_POINT==32)
-# define FRACBITS 31
-# define SAMPPROD int64_t
-#define SAMP_MAX 2147483647
-#else
-# define FRACBITS 15
-# define SAMPPROD int32_t 
-#define SAMP_MAX 32767
-#endif
+# if (FIXED_POINT==32)
+#  define FRACBITS 31
+#  define SAMPPROD int64_t
+#  define SAMP_MAX 2147483647
+# else
+#  define FRACBITS 15
+#  define SAMPPROD int32_t 
+#  define SAMP_MAX 32767
+# endif
 
-#define SAMP_MIN -SAMP_MAX
+# define SAMP_MIN -SAMP_MAX
 
-#if defined(CHECK_OVERFLOW)
+# if defined(CHECK_OVERFLOW)
 #  define CHECK_OVERFLOW_OP(a,op,b)  \
 	if ( (SAMPPROD)(a) op (SAMPPROD)(b) > SAMP_MAX || (SAMPPROD)(a) op (SAMPPROD)(b) < SAMP_MIN ) { \
 		fprintf(stderr,"WARNING:overflow @ " __FILE__ "(%d): (%d " #op" %d) = %ld\n",__LINE__,(a),(b),(SAMPPROD)(a) op (SAMPPROD)(b) );  }
-#endif
+# endif
 
 
 #   define smul(a,b) ( (SAMPPROD)(a)*(b) )
@@ -84,19 +100,50 @@ struct kiss_fft_state{
 #else  /* not FIXED_POINT*/
 
 #   define S_MUL(a,b) ( (a)*(b) )
+# if (0)
+  // no simd
 #define C_MUL(m,a,b) \
     do{ (m).r = (a).r*(b).r - (a).i*(b).i;\
         (m).i = (a).r*(b).i + (a).i*(b).r; }while(0)
+# else
+  // simd
+#define C_MUL(m,a,b) \
+    do{\
+        __m128d src1 = _mm_load_pd((double*)&((a).r));  /* a0 a1 */ \
+        __m128d src2 = _mm_load_pd((double*)&((b).r));  /* b0 b1 */ \
+        __m128d src3 = _mm_shuffle_pd(src2, src2, _MM_SHUFFLE2(0, 1));  /* b1 b0 */ \
+        __m128d src4 = _mm_mul_pd(src1, src2);  /* a0a1 b0b1 */ \
+        __m128d src5 = _mm_xor_pd(src4, _mm_set_pd(-0.0, 0.0));  /* a0a1 -b0b1 */ \
+        __m128d src6 = _mm_mul_pd(src1, src3);  /* a0b1 a1b0 */ \
+        __m128d src7 = _mm_hadd_pd(src5, src6);  /* */ \
+        _mm_store_pd((double*)&((m).r), src7);\
+    }while(0)
+# endif
+
 #   define C_FIXDIV(c,div) /* NOOP */
+# if (1)
+  // no simd
 #   define C_MULBYSCALAR( c, s ) \
     do{ (c).r *= (s);\
         (c).i *= (s); }while(0)
+# else
+  // simd
+#   define C_MULBYSCALAR( c, s ) \
+    do {\
+        __m128d src1 = _mm_load_pd((double*)&((c).r));\
+        __m128d src2 = _mm_set1_pd(s);\
+        __m128d src3 = _mm_mul_pd(src1, src2);\
+        _mm_store_pd((double*)&((c).r), src3);\
+    } while(0)
+# endif
 #endif
 
 #ifndef CHECK_OVERFLOW_OP
 #  define CHECK_OVERFLOW_OP(a,op,b) /* noop */
 #endif
 
+#if (0)
+  // no simd
 #define  C_ADD( res, a,b)\
     do { \
 	    CHECK_OVERFLOW_OP((a).r,+,(b).r)\
@@ -122,7 +169,57 @@ struct kiss_fft_state{
 	    CHECK_OVERFLOW_OP((res).i,-,(a).i)\
 	    (res).r -= (a).r;  (res).i -= (a).i; \
     }while(0)
+#else
+  // simd
+#define  C_ADD( res, a,b)\
+    do {\
+        __m128d src1 = _mm_load_pd((double*)&((a).r));\
+        __m128d src2 = _mm_load_pd((double*)&((b).r));\
+        __m128d src3 = _mm_add_pd(src1, src2);\
+        _mm_store_pd((double*)&((res).r), src3);\
+    } while(0)
+#define  C_SUB( res, a,b)\
+    do {\
+        __m128d src1 = _mm_load_pd((double*)&((a).r));\
+        __m128d src2 = _mm_load_pd((double*)&((b).r));\
+        __m128d src3 = _mm_sub_pd(src1, src2);\
+        _mm_store_pd((double*)&((res).r), src3);\
+    } while(0)
+#define C_ADDTO( res , a)\
+    do {\
+        __m128d src1 = _mm_load_pd((double*)&((res).r));\
+        __m128d src2 = _mm_load_pd((double*)&((a).r));\
+        __m128d src3 = _mm_add_pd(src1, src2);\
+        _mm_store_pd((double*)&((res).r), src3);\
+    } while(0)
+#define C_SUBFROM( res , a)\
+    do {\
+        __m128d src1 = _mm_load_pd((double*)&((res).r));\
+        __m128d src2 = _mm_load_pd((double*)&((a).r));\
+        __m128d src3 = _mm_sub_pd(src1, src2);\
+        _mm_store_pd((double*)&((res).r), src3);\
+    } while(0)
+  // simd
+#define  C_ADD2(res, a, b)\
+    do {\
+        __m128d src1 = _mm_load_pd((double*)&((a).r));\
+        __m128d src2 = _mm_load_pd((double*)&((b).r));\
+        __m128d src3 = _mm_add_pd(src1, src2);\
+        __m128d src4 = _mm_load_pd((double*)&((res).r));\
+        __m128d src5 = _mm_add_pd(src3, src4);\
+        _mm_store_pd((double*)&((res).r), src5);\
+    } while(0)
+#define C_ADDSUB(res1, res2, a, b) /* res1 = a+b, res2 = a-b*/\
+    do {\
+        __m128d src1 = _mm_load_pd((double*)&((a).r));\
+        __m128d src2 = _mm_load_pd((double*)&((b).r));\
+        __m128d src3 = _mm_add_pd(src1, src2);\
+        __m128d src4 = _mm_sub_pd(src1, src2);\
+        _mm_store_pd((double*)&((res1).r), src3);\
+        _mm_store_pd((double*)&((res2).r), src4);\
+    } while(0)
 
+#endif
 
 #ifdef FIXED_POINT
 #  define KISS_FFT_COS(phase)  floor(.5+SAMP_MAX * cos (phase))
@@ -131,7 +228,7 @@ struct kiss_fft_state{
 #elif defined(USE_SIMD)
 #  define KISS_FFT_COS(phase) _mm_set1_ps( cos(phase) )
 #  define KISS_FFT_SIN(phase) _mm_set1_ps( sin(phase) )
-#  define HALF_OF(x) ((x)*_mm_set1_ps(.5))
+#  define HALF_OF(x) ((x)*.5)
 #else
 #  define KISS_FFT_COS(phase) (kiss_fft_scalar) cos(phase)
 #  define KISS_FFT_SIN(phase) (kiss_fft_scalar) sin(phase)

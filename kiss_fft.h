@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <math.h>
 #include <string.h>
+#include <malloc.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -29,8 +30,8 @@ extern "C" {
 #define KISS_FFT_MALLOC(nbytes) _mm_malloc(nbytes,16)
 #define KISS_FFT_FREE _mm_free
 #else	
-#define KISS_FFT_MALLOC malloc
-#define KISS_FFT_FREE free
+#define KISS_FFT_MALLOC(nbytes) _aligned_malloc(nbytes, 16)
+#define KISS_FFT_FREE(a) _aligned_free(a)
 #endif	
 
 
@@ -44,7 +45,8 @@ extern "C" {
 #else
 # ifndef kiss_fft_scalar
 /*  default is float */
-#   define kiss_fft_scalar float
+//#   define kiss_fft_scalar float
+#   define kiss_fft_scalar double
 # endif
 #endif
 
